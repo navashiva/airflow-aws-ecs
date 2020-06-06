@@ -1,0 +1,258 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: A CloudFormation template for Airflow AWS resources.
+
+Parameters:
+  DatabaseInstanceType:
+    Default: db.r5.large
+    AllowedValues:
+      - db.t3.medium
+      - db.r5.large
+      - db.r5.xlarge
+      - db.r5.2xlarge
+    Description: The instance type to use for the database.
+    Type: String
+  DatabasePassword:
+    AllowedPattern: "[a-zA-Z0-9]+"
+    ConstraintDescription: must contain only alphanumeric characters.
+    Description: The database admin account password.
+    MaxLength: '41'
+    MinLength: '8'
+    NoEcho: 'true'
+    Type: String
+  DatabaseUsername:
+    AllowedPattern: "[a-zA-Z0-9]+"
+    ConstraintDescription: must contain only alphanumeric characters.
+    Description: The database admin account user name.
+    MaxLength: '16'
+    MinLength: '4'
+    Type: String
+  DatabaseBackupRetentionPeriod:
+    Type: String
+    Default: 7
+    AllowedValues:
+      - 1
+      - 7
+      - 14
+      - 30
+    Description: The database backup retention period in days.
+  DatabaseVPC:
+    Type: "AWS::EC2::VPC::Id"
+    Description: VPC for database instances
+  DatabaseSubnets:
+    Description: The subnets to place database instances in.
+    Type: List<AWS::EC2::Subnet::Id>
+  DeploymentEmail:
+    Description: Receipient of SNS alarms
+    Type: String
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Database Configuration
+        Parameters:
+          - DatabaseInstanceType
+          - DatabaseUsername
+          - DatabasePassword
+          - DatabaseSubnets
+          - DatabaseBackupRetentionPeriod
+          - DeploymentEmail
+          - DatabaseVPC
+    ParameterLabels:
+      DatabaseInstanceType:
+        default: Database Instance Type
+      DatabasePassword:
+        default: Database Password
+      DatabaseUsername:
+        default: Database Username
+      DatabaseBackupRetentionPeriod:
+        default: Database Backup Retention Period
+      DatabaseVPC:
+        default: Database VPC
+      DatabaseSubnets:
+        default: Database Subnets
+      DatabaseSecurityGroups:
+        default: Database Security Groups
+      DeploymentEmail:
+        default: SNS Alarm Recipient
+
+Resources:
+
+  AirflowRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      LifecyclePolicy:
+        RegistryId: !Ref AWS::AccountId
+        LifecyclePolicyText: "{
+                                  \"rules\": [
+                                      {
+                                          \"rulePriority\": 1,
+                                          \"description\": \"Expire images older than 30 days\",
+                                          \"selection\": {
+                                              \"tagStatus\": \"untagged\",
+                                              \"countType\": \"sinceImagePushed\",
+                                              \"countUnit\": \"days\",
+                                              \"countNumber\": 30
+                                          },
+                                          \"action\": {
+                                              \"type\": \"expire\"
+                                          }
+                                      }
+                                  ]
+                              }"
+
+  StoreLogs:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  StackAlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: Stack Alarm Topic
+      Subscription:
+        - Endpoint: !Ref DeploymentEmail
+          Protocol: "email"
+
+  DatabaseSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: "SecurityGroup for Aurora PostGreSQL instances"
+      VpcId: !Ref DatabaseVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: '5432'
+          ToPort: '5432'
+          CidrIp: 0.0.0.0/0
+
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    #DeletionPolicy: Retain
+    Properties:
+      DBSubnetGroupDescription: CloudFormation managed DB subnet group.
+      SubnetIds:
+        Ref: DatabaseSubnets
+
+  DatabaseParameterGroup:
+    Type: AWS::RDS::DBClusterParameterGroup
+    #DeletionPolicy: Retain
+    Properties:
+      Description: Cluster parameter group
+      Family: aurora-postgresql9.6
+      Parameters:
+        autovacuum: true
+
+  DatabaseCluster:
+    Type: AWS::RDS::DBCluster
+    #DeletionPolicy: Retain
+    Properties:
+      Engine: aurora-postgresql
+      EngineVersion: 9.6.12
+      MasterUsername:
+        Ref: DatabaseUsername
+      MasterUserPassword:
+        Ref: DatabasePassword
+      BackupRetentionPeriod:
+        Ref: DatabaseBackupRetentionPeriod
+      StorageEncrypted: true
+      Port: 5432
+      DBClusterParameterGroupName:
+        Ref: DatabaseParameterGroup
+      PreferredBackupWindow: 02:00-03:00
+      PreferredMaintenanceWindow: mon:03:00-mon:04:00
+      DBSubnetGroupName:
+        Ref: DatabaseSubnetGroup
+      VpcSecurityGroupIds:
+        - Ref: DatabaseSecurityGroup
+
+  DatabasePrimaryInstance:
+    Type: AWS::RDS::DBInstance
+    #DeletionPolicy: Retain
+    Properties:
+      Engine: aurora-postgresql
+      DBClusterIdentifier:
+        Ref: DatabaseCluster
+      DBInstanceClass:
+        Ref: DatabaseInstanceType
+      DBSubnetGroupName:
+        Ref: DatabaseSubnetGroup
+
+  DatabasePrimaryCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    #DeletionPolicy: Retain
+    Properties:
+      AlarmDescription: Primary database CPU utilization is over 80%.
+      Namespace: AWS/RDS
+      MetricName: CPUUtilization
+      Unit: Percent
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value:
+            Ref: DatabasePrimaryInstance
+      AlarmActions:
+        - Ref: StackAlarmTopic
+      InsufficientDataActions:
+        - Ref: StackAlarmTopic
+
+  DatabasePrimaryMemoryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    #DeletionPolicy: Retain
+    Properties:
+      AlarmDescription: Primary database freeable memory is under 100MB.
+      Namespace: AWS/RDS
+      MetricName: FreeableMemory
+      Unit: Bytes
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 100000000
+      ComparisonOperator: LessThanOrEqualToThreshold
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value:
+            Ref: DatabasePrimaryInstance
+      AlarmActions:
+        - Ref: StackAlarmTopic
+      InsufficientDataActions:
+        - Ref: StackAlarmTopic
+
+Outputs:
+
+  AirflowRepo:
+    Description: ECR ARN for Apache Airflow
+    Value: !GetAtt AirflowRepo.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AirflowRepo'
+
+  StoreLogs:
+    Value: !GetAtt StoreLogs.Arn
+    Export:
+      Name:
+        !Sub "${AWS::StackName}-StoreLogs"
+
+  TopicArn:
+    Description: SNS Topic Arn for all notifications
+    Value: !Ref StackAlarmTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-TopicArn'
+
+  DatabaseServerName:
+    Description: The endpoint of aurora primary writer
+    Value:
+      Fn::GetAtt: [DatabaseCluster, Endpoint.Address]
+    Export:
+      Name: !Sub '${AWS::StackName}-ServerName'
+
+  DatabaseUserName:
+    Description: Username for database
+    Value: !Ref DatabaseUsername
+    Export:
+      Name: !Sub '${AWS::StackName}-UserName'
