@@ -41,6 +41,39 @@ Parameters:
 
 Resources:
 
+  EFSFileSystem:
+    Type: "AWS::EFS::FileSystem"
+    Properties:
+      Encrypted: true
+      PerformanceMode: generalPurpose
+
+  EFSSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: "SecurityGroup for EFS mount"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: '2049'
+          ToPort: '2049'
+          CidrIp: 0.0.0.0/0
+
+  EFSMountTarget1:
+    Type: "AWS::EFS::MountTarget"
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+      SubnetId: !Ref SubnetA
+
+  EFSMountTarget2:
+    Type: "AWS::EFS::MountTarget"
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+      SubnetId: !Ref SubnetB
+
   Airflow:
     Type: AWS::ECS::Cluster
     Properties:
@@ -96,6 +129,16 @@ Resources:
                 Resource:
                   - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${DBPasswordStore}"
                   - !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/ssm"
+        - PolicyName: !Sub "${AWS::StackName}-EFSAccess"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "elasticfilesystem:List*"
+                  - "elasticfilesystem:Describe*"
+                  - "elasticfilesystem:Client*"
+                Resource: "*"
   # A role for the containers
   TaskRole:
     Type: AWS::IAM::Role
@@ -120,185 +163,324 @@ Resources:
                 Resource:
                   - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${DBPasswordStore}"
                   - !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/ssm"
+        - PolicyName: !Sub "${AWS::StackName}-EFSAccess"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "elasticfilesystem:List*"
+                  - "elasticfilesystem:Describe*"
+                  - "elasticfilesystem:Client*"
+                Resource: "*"
+
+  CustomResourceFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        ZipFile: |
+          const aws = require('aws-sdk')
+          const response = require('cfn-response')
+          const ecs = new aws.ECS({apiVersion: '2014-11-13'})
+          exports.handler = function(event, context) {
+            console.log("REQUEST RECEIVED:\n" + JSON.stringify(event))
+            if (event.RequestType === 'Create' || event.RequestType === 'Update') {
+              ecs.registerTaskDefinition(event.ResourceProperties.TaskDefinition, function(err, data) {
+                if (err) {
+                  console.error(err);
+                  response.send(event, context, response.FAILED)
+                } else {
+                  console.log(`Created/Updated task definition ${data.taskDefinition.taskDefinitionArn}`)
+                  response.send(event, context, response.SUCCESS, {Arn: data.taskDefinition.taskDefinitionArn}, data.taskDefinition.taskDefinitionArn)
+                }
+              })
+            } else if (event.RequestType === 'Delete') {
+              ecs.deregisterTaskDefinition({taskDefinition: event.PhysicalResourceId}, function(err) {
+                if (err) {
+                  if (err.code === 'InvalidParameterException') {
+                    console.log(`Task definition: ${event.PhysicalResourceId} does not exist. Skipping deletion.`)
+                    response.send(event, context, response.SUCCESS)
+                  } else {
+                    console.error(err)
+                    response.send(event, context, response.FAILED)
+                  }
+                } else {
+                  console.log(`Removed task definition ${event.PhysicalResourceId}`)
+                  response.send(event, context, response.SUCCESS)
+                }
+              })
+            } else {
+              console.error(`Unsupported request type: ${event.RequestType}`)
+              response.send(event, context, response.FAILED)
+            }
+          }
+      Handler: 'index.handler'
+      MemorySize: 128
+      Role: !GetAtt 'CustomResourceRole.Arn'
+      Runtime: 'nodejs10.x'
+      Timeout: 30
+
+  CustomResourceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 'lambda.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: 'customresource'
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ecs:DeregisterTaskDefinition'
+                  - 'ecs:RegisterTaskDefinition'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'iam:PassRole'
+                Resource: '*'
 
   WebServerTD:
-    Type: AWS::ECS::TaskDefinition
-    # Makes sure the log group is created before it is used.
+    Type: 'Custom::TaskDefinition'
+    Version: '1.0'
     DependsOn: WebServerLG
     Properties:
-      # awsvpc is required for Fargate
-      NetworkMode: awsvpc
-      RequiresCompatibilities:
-        - FARGATE
-      # 256 (.25 vCPU) - Available memory values: 0.5GB, 1GB, 2GB
-      # 512 (.5 vCPU) - Available memory values: 1GB, 2GB, 3GB, 4GB
-      # 1024 (1 vCPU) - Available memory values: 2GB, 3GB, 4GB, 5GB, 6GB, 7GB, 8GB
-      # 2048 (2 vCPU) - Available memory values: Between 4GB and 16GB in 1GB increments
-      # 4096 (4 vCPU) - Available memory values: Between 8GB and 30GB in 1GB increments
-      Cpu: 512
-      # 0.5GB, 1GB, 2GB - Available cpu values: 256 (.25 vCPU)
-      # 1GB, 2GB, 3GB, 4GB - Available cpu values: 512 (.5 vCPU)
-      # 2GB, 3GB, 4GB, 5GB, 6GB, 7GB, 8GB - Available cpu values: 1024 (1 vCPU)
-      # Between 4GB and 16GB in 1GB increments - Available cpu values: 2048 (2 vCPU)
-      # Between 8GB and 30GB in 1GB increments - Available cpu values: 4096 (4 vCPU)
-      Memory: 1GB
-      # A role needed by ECS.
-      # "The ARN of the task execution role that containers in this task can assume. All containers in this task are granted the permissions that are specified in this role."
-      # "There is an optional task execution IAM role that you can specify with Fargate to allow your Fargate tasks to make API calls to Amazon ECR."
-      ExecutionRoleArn: !Ref ExecutionRole
-      # "The Amazon Resource Name (ARN) of an AWS Identity and Access Management (IAM) role that grants containers in the task permission to call AWS APIs on your behalf."
-      TaskRoleArn: !Ref TaskRole
-      ContainerDefinitions:
-        - Name: !Sub "${AWS::StackName}-WebServer"
-          Image: !Ref AirflowImage
-          EntryPoint:
-            - /entrypoint.sh
-            - webserver
-          PortMappings:
-            - ContainerPort: 8080
-          # Send logs to CloudWatch Logs
-          LogConfiguration:
-            LogDriver: awslogs
-            Options:
-              awslogs-region: !Ref AWS::Region
-              awslogs-group: !Ref WebServerLG
-              awslogs-stream-prefix: ecs
-          Secrets:
-            - Name: POSTGRES_PASSWORD
-              ValueFrom: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${DBPasswordStore}"
-          Environment:
-            - Name: AIRFLOW__CORE__LOAD_EXAMPLES
-              Value: True
-            - Name: POSTGRES_HOST
-              Value:
-                Fn::ImportValue: !Sub "${ResourcesStack}-ServerName"
-            - Name: POSTGRES_PORT
-              Value: 5432
-            - Name: POSTGRES_DB
-              Value: postgres
-            - Name: POSTGRES_USER
-              Value:
-                Fn::ImportValue: !Sub "${ResourcesStack}-UserName"
+      ServiceToken: !GetAtt 'CustomResourceFunction.Arn'
+      TaskDefinition: {
+        containerDefinitions: [
+        {
+          name: !Sub "${AWS::StackName}-WebServer",
+          image: !Ref AirflowImage,
+          entryPoint: [
+            "/entrypoint.sh",
+            "webserver"
+          ],
+          mountPoints: [
+          {sourceVolume: "efs", containerPath: "/usr/local/airflow/dags"}
+          ],
+          portMappings: [{
+                           containerPort: 8080
+                         }
+          ],
+          logConfiguration: {
+                              logDriver: "awslogs",
+                              options: {
+                                         awslogs-region: !Sub "${AWS::Region}",
+                                         awslogs-group: !Ref WebServerLG,
+                                         awslogs-stream-prefix: "ecs"
+                              }
+
+          },
+          secrets: [{
+                      name: "POSTGRES_PASSWORD",
+                      valueFrom: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${DBPasswordStore}"
+                    }
+          ],
+          environment:[{
+                         name: "AIRFLOW__CORE__LOAD_EXAMPLES",
+                         value: "True"
+                       },
+                       {
+                         name: "POSTGRES_HOST",
+                         value: { "Fn::ImportValue" : !Sub "${ResourcesStack}-ServerName" }
+                       },
+                       {
+                         name: "POSTGRES_PORT",
+                         value: "5432"
+                       },
+                       {
+                         name: "POSTGRES_DB",
+                         value: "postgres"
+                       },
+                       {
+                         name: "POSTGRES_USER",
+                         value: { "Fn::ImportValue" : !Sub "${ResourcesStack}-UserName" }
+                       }
+          ]
+        }
+        ],
+        requiresCompatibilities: ["FARGATE"],
+        taskRoleArn: !Ref TaskRole, # required for EFS permissions
+        cpu: "512",
+        memory: "1GB",
+        family: !Sub "${AWS::StackName}-WebServer",
+        executionRoleArn: !Ref ExecutionRole,
+        networkMode: "awsvpc",
+        volumes: [
+        {
+          name: "efs",
+          efsVolumeConfiguration: {
+            fileSystemId: !Ref EFSFileSystem
+          }
+        }
+        ]
+      }
 
   SchedulerTD:
-    Type: AWS::ECS::TaskDefinition
-    # Makes sure the log group is created before it is used.
+    Type: 'Custom::TaskDefinition'
+    Version: '1.0'
     DependsOn: SchedulerLG
     Properties:
-      # awsvpc is required for Fargate
-      NetworkMode: awsvpc
-      RequiresCompatibilities:
-        - FARGATE
-      # 256 (.25 vCPU) - Available memory values: 0.5GB, 1GB, 2GB
-      # 512 (.5 vCPU) - Available memory values: 1GB, 2GB, 3GB, 4GB
-      # 1024 (1 vCPU) - Available memory values: 2GB, 3GB, 4GB, 5GB, 6GB, 7GB, 8GB
-      # 2048 (2 vCPU) - Available memory values: Between 4GB and 16GB in 1GB increments
-      # 4096 (4 vCPU) - Available memory values: Between 8GB and 30GB in 1GB increments
-      Cpu: 512
-      # 0.5GB, 1GB, 2GB - Available cpu values: 256 (.25 vCPU)
-      # 1GB, 2GB, 3GB, 4GB - Available cpu values: 512 (.5 vCPU)
-      # 2GB, 3GB, 4GB, 5GB, 6GB, 7GB, 8GB - Available cpu values: 1024 (1 vCPU)
-      # Between 4GB and 16GB in 1GB increments - Available cpu values: 2048 (2 vCPU)
-      # Between 8GB and 30GB in 1GB increments - Available cpu values: 4096 (4 vCPU)
-      Memory: 2GB
-      # A role needed by ECS.
-      # "The ARN of the task execution role that containers in this task can assume. All containers in this task are granted the permissions that are specified in this role."
-      # "There is an optional task execution IAM role that you can specify with Fargate to allow your Fargate tasks to make API calls to Amazon ECR."
-      ExecutionRoleArn: !Ref ExecutionRole
-      # "The Amazon Resource Name (ARN) of an AWS Identity and Access Management (IAM) role that grants containers in the task permission to call AWS APIs on your behalf."
-      TaskRoleArn: !Ref TaskRole
-      ContainerDefinitions:
-        - Name: !Sub "${AWS::StackName}-Scheduler"
-          Image: !Ref AirflowImage
-          EntryPoint:
-            - /entrypoint.sh
-            - scheduler
-          # Send logs to CloudWatch Logs
-          LogConfiguration:
-            LogDriver: awslogs
-            Options:
-              awslogs-region: !Ref AWS::Region
-              awslogs-group: !Ref SchedulerLG
-              awslogs-stream-prefix: ecs
-          Secrets:
-            - Name: POSTGRES_PASSWORD
-              ValueFrom: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${DBPasswordStore}"
-          Environment:
-            - Name: AIRFLOW__CORE__LOAD_EXAMPLES
-              Value: True
-            - Name: REDIS_HOST
-              Value: !GetAtt Redis.RedisEndpoint.Address
-            - Name: POSTGRES_HOST
-              Value:
-                Fn::ImportValue: !Sub "${ResourcesStack}-ServerName"
-            - Name: POSTGRES_PORT
-              Value: 5432
-            - Name: POSTGRES_DB
-              Value: postgres
-            - Name: POSTGRES_USER
-              Value:
-                Fn::ImportValue: !Sub "${ResourcesStack}-UserName"
+      ServiceToken: !GetAtt 'CustomResourceFunction.Arn'
+      TaskDefinition: {
+        containerDefinitions: [
+        {
+          name: !Sub "${AWS::StackName}-Scheduler",
+          image: !Ref AirflowImage,
+          entryPoint: [
+            "/entrypoint.sh",
+            "scheduler"
+          ],
+          mountPoints: [
+          {sourceVolume: "efs", containerPath: "/usr/local/airflow/dags"}
+          ],
+          logConfiguration: {
+            logDriver: "awslogs",
+            options: {
+              awslogs-region: !Sub "${AWS::Region}",
+              awslogs-group: !Ref SchedulerLG,
+              awslogs-stream-prefix: "ecs"
+            }
+
+          },
+          secrets: [{
+                      name: "POSTGRES_PASSWORD",
+                      valueFrom: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${DBPasswordStore}"
+                    }
+          ],
+          environment:[{
+                         name: "AIRFLOW__CORE__LOAD_EXAMPLES",
+                         value: "True"
+                       },
+                       {
+                         name: "REDIS_HOST",
+                         value: !GetAtt Redis.RedisEndpoint.Address
+                       },
+                       {
+                         name: "POSTGRES_HOST",
+                         value: { "Fn::ImportValue" : !Sub "${ResourcesStack}-ServerName" }
+                       },
+                       {
+                         name: "POSTGRES_PORT",
+                         value: "5432"
+                       },
+                       {
+                         name: "POSTGRES_DB",
+                         value: "postgres"
+                       },
+                       {
+                         name: "POSTGRES_USER",
+                         value: { "Fn::ImportValue" : !Sub "${ResourcesStack}-UserName" }
+                       }
+          ]
+        }
+        ],
+        requiresCompatibilities: ["FARGATE"],
+        taskRoleArn: !Ref TaskRole, # required for EFS permissions
+        cpu: "512",
+        memory: "2GB",
+        family: !Sub "${AWS::StackName}-Scheduler",
+        executionRoleArn: !Ref ExecutionRole,
+        networkMode: "awsvpc",
+        volumes: [
+        {
+          name: "efs",
+          efsVolumeConfiguration: {
+            fileSystemId: !Ref EFSFileSystem
+          }
+        }
+        ]
+      }
 
   WorkerTD:
-    Type: AWS::ECS::TaskDefinition
-    # Makes sure the log group is created before it is used.
+    Type: 'Custom::TaskDefinition'
+    Version: '1.0'
     DependsOn: WorkerLG
     Properties:
-      # awsvpc is required for Fargate
-      NetworkMode: awsvpc
-      RequiresCompatibilities:
-        - FARGATE
-      # 256 (.25 vCPU) - Available memory values: 0.5GB, 1GB, 2GB
-      # 512 (.5 vCPU) - Available memory values: 1GB, 2GB, 3GB, 4GB
-      # 1024 (1 vCPU) - Available memory values: 2GB, 3GB, 4GB, 5GB, 6GB, 7GB, 8GB
-      # 2048 (2 vCPU) - Available memory values: Between 4GB and 16GB in 1GB increments
-      # 4096 (4 vCPU) - Available memory values: Between 8GB and 30GB in 1GB increments
-      Cpu: 1024
-      # 0.5GB, 1GB, 2GB - Available cpu values: 256 (.25 vCPU)
-      # 1GB, 2GB, 3GB, 4GB - Available cpu values: 512 (.5 vCPU)
-      # 2GB, 3GB, 4GB, 5GB, 6GB, 7GB, 8GB - Available cpu values: 1024 (1 vCPU)
-      # Between 4GB and 16GB in 1GB increments - Available cpu values: 2048 (2 vCPU)
-      # Between 8GB and 30GB in 1GB increments - Available cpu values: 4096 (4 vCPU)
-      Memory: 3GB
-      # A role needed by ECS.
-      # "The ARN of the task execution role that containers in this task can assume. All containers in this task are granted the permissions that are specified in this role."
-      # "There is an optional task execution IAM role that you can specify with Fargate to allow your Fargate tasks to make API calls to Amazon ECR."
-      ExecutionRoleArn: !Ref ExecutionRole
-      # "The Amazon Resource Name (ARN) of an AWS Identity and Access Management (IAM) role that grants containers in the task permission to call AWS APIs on your behalf."
-      TaskRoleArn: !Ref TaskRole
-      ContainerDefinitions:
-        - Name: !Sub "${AWS::StackName}-Worker"
-          Image: !Ref AirflowImage
-          EntryPoint:
-            - /entrypoint.sh
-            - worker
-          PortMappings:
-            - ContainerPort: 8793
-          # Send logs to CloudWatch Logs
-          LogConfiguration:
-            LogDriver: awslogs
-            Options:
-              awslogs-region: !Ref AWS::Region
-              awslogs-group: !Ref WorkerLG
-              awslogs-stream-prefix: ecs
-          Secrets:
-            - Name: POSTGRES_PASSWORD
-              ValueFrom: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${DBPasswordStore}"
-          Environment:
-            - Name: AIRFLOW__CORE__LOAD_EXAMPLES
-              Value: True
-            - Name: REDIS_HOST
-              Value: !GetAtt Redis.RedisEndpoint.Address
-            - Name: POSTGRES_HOST
-              Value:
-                Fn::ImportValue: !Sub "${ResourcesStack}-ServerName"
-            - Name: POSTGRES_PORT
-              Value: 5432
-            - Name: POSTGRES_DB
-              Value: postgres
-            - Name: POSTGRES_USER
-              Value:
-                Fn::ImportValue: !Sub "${ResourcesStack}-UserName"
+      ServiceToken: !GetAtt 'CustomResourceFunction.Arn'
+      TaskDefinition: {
+        containerDefinitions: [
+        {
+          name: !Sub "${AWS::StackName}-Worker",
+          image: !Ref AirflowImage,
+          entryPoint: [
+            "/entrypoint.sh",
+            "worker"
+          ],
+          mountPoints: [
+          {sourceVolume: "efs", containerPath: "/usr/local/airflow/dags"}
+          ],
+          portMappings: [{
+                           containerPort: 8793
+                         }
+          ],
+          logConfiguration: {
+            logDriver: "awslogs",
+            options: {
+              awslogs-region: !Sub "${AWS::Region}",
+              awslogs-group: !Ref WorkerLG,
+              awslogs-stream-prefix: "ecs"
+            }
+
+          },
+          secrets: [{
+                      name: "POSTGRES_PASSWORD",
+                      valueFrom: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${DBPasswordStore}"
+                    }
+          ],
+          environment:[{
+                         name: "AIRFLOW__CORE__LOAD_EXAMPLES",
+                         value: "True"
+                       },
+                       {
+                         name: "REDIS_HOST",
+                         value: !GetAtt Redis.RedisEndpoint.Address
+                       },
+                       {
+                         name: "POSTGRES_HOST",
+                         value: { "Fn::ImportValue" : !Sub "${ResourcesStack}-ServerName" }
+                       },
+                       {
+                         name: "POSTGRES_PORT",
+                         value: "5432"
+                       },
+                       {
+                         name: "POSTGRES_DB",
+                         value: "postgres"
+                       },
+                       {
+                         name: "POSTGRES_USER",
+                         value: { "Fn::ImportValue" : !Sub "${ResourcesStack}-UserName" }
+                       }
+          ]
+        }
+        ],
+        requiresCompatibilities: ["FARGATE"],
+        taskRoleArn: !Ref TaskRole, # required for EFS permissions
+        cpu: "1024",
+        memory: "3GB",
+        family: !Sub "${AWS::StackName}-Worker",
+        executionRoleArn: !Ref ExecutionRole,
+        networkMode: "awsvpc",
+        volumes: [
+        {
+          name: "efs",
+          efsVolumeConfiguration: {
+            fileSystemId: !Ref EFSFileSystem
+          }
+        }
+        ]
+      }
 
   FlowerTD:
     Type: AWS::ECS::TaskDefinition
@@ -358,7 +540,6 @@ Resources:
             - Name: POSTGRES_USER
               Value:
                 Fn::ImportValue: !Sub "${ResourcesStack}-UserName"
-
   # A role needed for auto scaling
   WorkerAutoScaleRole:
     Type: AWS::IAM::Role
@@ -478,13 +659,16 @@ Resources:
     # This dependency is needed so that the load balancer is setup correctly in time
     DependsOn:
       - WebServerListener
+      - EFSMountTarget1
+      - EFSMountTarget2
     Properties:
       Cluster: !Ref Airflow
-      TaskDefinition: !Ref WebServerTD
+      TaskDefinition: !GetAtt WebServerTD.Arn
       DeploymentConfiguration:
         MinimumHealthyPercent: 100
         MaximumPercent: 200
       DesiredCount: 1
+      PlatformVersion: 1.4.0
       # This may need to be adjusted if the container takes a while to start up
       HealthCheckGracePeriodSeconds: 30
       LaunchType: FARGATE
@@ -514,6 +698,7 @@ Resources:
         MinimumHealthyPercent: 100
         MaximumPercent: 200
       DesiredCount: 1
+      PlatformVersion: 1.4.0
       # This may need to be adjusted if the container takes a while to start up
       HealthCheckGracePeriodSeconds: 30
       LaunchType: FARGATE
@@ -533,13 +718,17 @@ Resources:
 
   Scheduler:
     Type: AWS::ECS::Service
+    DependsOn:
+      - EFSMountTarget1
+      - EFSMountTarget2
     Properties:
       Cluster: !Ref Airflow
-      TaskDefinition: !Ref SchedulerTD
+      TaskDefinition: !GetAtt SchedulerTD.Arn
       DeploymentConfiguration:
         MinimumHealthyPercent: 100
         MaximumPercent: 200
       DesiredCount: 1
+      PlatformVersion: 1.4.0
       LaunchType: FARGATE
       NetworkConfiguration:
         AwsvpcConfiguration:
@@ -553,13 +742,17 @@ Resources:
 
   Worker:
     Type: AWS::ECS::Service
+    DependsOn:
+      - EFSMountTarget1
+      - EFSMountTarget2
     Properties:
       Cluster: !Ref Airflow
-      TaskDefinition: !Ref WorkerTD
+      TaskDefinition: !GetAtt WorkerTD.Arn
       DeploymentConfiguration:
         MinimumHealthyPercent: 100
         MaximumPercent: 200
       DesiredCount: 1
+      PlatformVersion: 1.4.0
       LaunchType: FARGATE
       NetworkConfiguration:
         AwsvpcConfiguration:

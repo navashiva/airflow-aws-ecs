@@ -141,7 +141,7 @@ Resources:
     #DeletionPolicy: Retain
     Properties:
       Description: Cluster parameter group
-      Family: aurora-postgresql9.6
+      Family: aurora-postgresql11
       Parameters:
         autovacuum: true
 
@@ -150,7 +150,7 @@ Resources:
     #DeletionPolicy: Retain
     Properties:
       Engine: aurora-postgresql
-      EngineVersion: 9.6.12
+      EngineVersion: 11.7
       MasterUsername:
         Ref: DatabaseUsername
       MasterUserPassword:
