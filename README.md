@@ -4,6 +4,9 @@ A guide to setup Apache Airflow on AWS ECS service using Fargate.
 
 > Follow the below steps sequentially
 
+## Deployment Architecture
+![Alt text](docs/images/DeploymentArchitecture.jpeg?raw=true "Airflow on AWS ECS")
+
 ## Prerequisites
 - AWS CLI access to account with permissions to ECR, ParameterStore and KMS.
 - Docker
